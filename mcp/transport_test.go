@@ -108,7 +108,7 @@ func TestIOConnRead(t *testing.T) {
 			})
 			t.Cleanup(func() { tr.Close() })
 			if tt.protocolVersion != "" {
-				tr.sessionUpdated(ServerSessionState{
+				tr.sessionUpdated(context.Background(), ServerSessionState{
 					InitializeParams: &InitializeParams{
 						ProtocolVersion: tt.protocolVersion,
 					},

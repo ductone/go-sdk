@@ -67,6 +67,11 @@ type sessionInfo struct {
 	timerMu sync.Mutex
 	refs    int // reference count
 	timer   *time.Timer
+
+	// FORK: distributed-sessions
+	// remoteSession is set when the session exists in the backend but not locally.
+	// This is used to route requests to the correct pod.
+	remoteSession *remoteSessionInfo
 }
 
 // startPOST signals that a POST request for this session is starting (which
@@ -218,6 +223,14 @@ type StreamableHTTPOptions struct {
 	// Requests using older protocol versions (including those routed through
 	// the allowsessionsinstateless compatibility path) are unaffected.
 	PropagateRequestCancellation bool
+
+	// FORK: distributed-sessions
+	// SessionBackend enables distributed session management across multiple
+	// server replicas. When set, session state is persisted to the backend
+	// and messages can be routed between pods.
+	//
+	// If nil, sessions are stored only in memory on the local pod.
+	SessionBackend SessionBackend
 }
 
 // DefaultMaxRequestBodyBytes is the default value used for
@@ -574,11 +587,23 @@ func (h *StreamableHTTPHandler) serveStateful(w http.ResponseWriter, req *http.R
 // false, an error response has been written. The sessionID must be non-empty;
 // callers are responsible for checking this before calling lookupSession.
 func (h *StreamableHTTPHandler) lookupSession(w http.ResponseWriter, req *http.Request, sessionID string) (info *sessionInfo, ok bool) {
-	h.mu.Lock()
-	info = h.sessions[sessionID]
-	h.mu.Unlock()
+	// FORK: distributed-sessions - the session may live in the backend, and may
+	// be owned by another pod. Falls back to the local map when no backend is
+	// configured.
+	info, err := h.lookupSessionFromBackend(req.Context(), sessionID)
+	if err != nil {
+		h.opts.Logger.Error("session lookup failed", "error", err, "sessionID", sessionID)
+		http.Error(w, "session lookup failed", http.StatusInternalServerError)
+		return nil, false
+	}
 	if info == nil {
 		http.Error(w, "session not found", http.StatusNotFound)
+		return nil, false
+	}
+	// FORK: distributed-sessions - the session exists in the backend but not
+	// locally, so proxy the request to the pod that owns it.
+	if info.remoteSession != nil {
+		h.handleRemoteSession(w, req, info.remoteSession)
 		return nil, false
 	}
 	if info.userID != "" {
@@ -657,6 +682,12 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 		}
 		sessInfo.startPOST()
 		defer sessInfo.endPOST()
+		// FORK: distributed-sessions - extend backend TTL on activity
+		if h.hasSessionBackend() {
+			if err := h.touchSessionInBackend(req.Context(), sessionID); err != nil {
+				h.opts.Logger.Warn("failed to touch session in backend", "error", err, "sessionID", sessionID)
+			}
+		}
 		sessInfo.transport.ServeHTTP(w, req)
 		return
 	}
@@ -667,7 +698,20 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 		http.Error(w, "no server available", http.StatusBadRequest)
 		return
 	}
-	sessionID = server.opts.GetSessionID()
+	// FORK: distributed-sessions - the backend owns ID generation when configured,
+	// so that peers can resolve the session.
+	if h.hasSessionBackend() {
+		initialData := &SessionData{} // updated once the session is fully created
+		var err error
+		sessionID, err = h.opts.SessionBackend.Create(req.Context(), initialData)
+		if err != nil {
+			h.opts.Logger.Error("failed to create session in backend", "error", err)
+			http.Error(w, "failed to create session", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		sessionID = server.opts.GetSessionID()
+	}
 
 	transport := &StreamableServerTransport{
 		SessionID:    sessionID,
@@ -675,6 +719,34 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 		EventStore:   h.opts.EventStore,
 		jsonResponse: h.opts.JSONResponse,
 		logger:       h.opts.Logger,
+	}
+	// FORK: distributed-sessions - set up message routing callbacks
+	if h.hasSessionBackend() {
+		transport.OnSSEStart = func(ctx context.Context, writer func(data []byte) error, closeSSE func()) {
+			// This callback blocks - it runs in a goroutine spawned by the caller.
+			err := h.subscribeFromBackend(ctx, sessionID, func(ctx context.Context, msg []byte) error {
+				return writer(msg)
+			})
+			if err != nil && ctx.Err() == nil {
+				h.opts.Logger.Error("backend subscription ended", "error", err, "sessionID", sessionID)
+				// If subscription was superseded, close the SSE stream
+				if errors.Is(err, ErrSubscriptionSuperseded) {
+					closeSSE()
+				}
+			}
+		}
+		// FORK: distributed-sessions - persist state changes to backend
+		transport.OnStateChange = func(ctx context.Context, state ServerSessionState) error {
+			// This callback blocks - it runs in a goroutine spawned by the caller.
+			// Use a timeout derived from the request context.
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			return h.updateSessionStateInBackend(ctx, sessionID, &state)
+		}
+		// FORK: distributed-sessions - route messages when not SSE owner
+		transport.OnPublish = func(ctx context.Context, sid string, msg []byte) error {
+			return h.opts.SessionBackend.Publish(ctx, sid, msg)
+		}
 	}
 
 	// Sessions without a session ID (GetSessionID returned "") are ephemeral:
@@ -707,6 +779,13 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 			if info, ok := h.sessions[transport.SessionID]; ok {
 				info.stopTimer()
 				delete(h.sessions, transport.SessionID)
+				// FORK: distributed-sessions - cleanup backend
+				if h.hasSessionBackend() {
+					// Use background context since the request context may be done
+					if err := h.deleteSessionFromBackend(context.Background(), transport.SessionID); err != nil {
+						h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", transport.SessionID)
+					}
+				}
 				if h.onTransportDeletion != nil {
 					h.onTransportDeletion(transport.SessionID)
 				}
@@ -744,6 +823,13 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 	h.mu.Lock()
 	h.sessions[transport.SessionID] = sessInfo
 	h.mu.Unlock()
+	// FORK: distributed-sessions - update backend with complete session data
+	if h.hasSessionBackend() {
+		if err := h.createSessionInBackend(req.Context(), sessInfo); err != nil {
+			h.opts.Logger.Error("failed to update session in backend", "error", err, "sessionID", transport.SessionID)
+			// Continue anyway - the session exists locally
+		}
+	}
 	defer func() {
 		// If initialization failed, clean up the session (#578).
 		if session.InitializeParams() == nil {
@@ -849,6 +935,34 @@ type StreamableServerTransport struct {
 	// [streamableServerConn]. See its docstring.
 	shouldPropagateCancellation bool
 
+	// FORK: distributed-sessions
+	// OnSSEStart is called in a goroutine when a standalone SSE stream is established
+	// (GET request). The callback receives:
+	//   - ctx: cancelled when SSE ends
+	//   - writer: writes raw message bytes to the SSE stream
+	//   - closeSSE: closes the SSE stream (e.g., when subscription is superseded)
+	//
+	// The callback may block (e.g., to run a message subscription loop).
+	// It will be called in its own goroutine by the SDK.
+	OnSSEStart func(ctx context.Context, writer func(data []byte) error, closeSSE func())
+
+	// FORK: distributed-sessions
+	// OnStateChange is called in a goroutine when the session state changes
+	// (e.g., after Initialize, setLogLevel). This allows the handler to persist
+	// state to the SessionBackend.
+	//
+	// The callback receives the request context and may block.
+	// It will be called in its own goroutine by the SDK.
+	// Return nil to indicate success, or an error which will be logged.
+	OnStateChange func(ctx context.Context, state ServerSessionState) error
+
+	// FORK: distributed-sessions
+	// OnPublish routes messages to the SSE owner when this pod is not the owner.
+	// Called when Write() targets the standalone SSE stream but no local SSE
+	// connection is active. If nil and the pod is not the owner, writes return
+	// an error.
+	OnPublish func(ctx context.Context, sessionID string, msg []byte) error
+
 	// connection is non-nil if and only if the transport has been connected.
 	connection *streamableServerConn
 }
@@ -865,6 +979,8 @@ func (t *StreamableServerTransport) Connect(ctx context.Context) (Connection, er
 		jsonResponse:                t.jsonResponse,
 		logger:                      ensureLogger(t.logger), // see #556: must be non-nil
 		shouldPropagateCancellation: t.shouldPropagateCancellation,
+		onStateChange:               t.OnStateChange, // FORK: distributed-sessions
+		onPublish:                   t.OnPublish,     // FORK: distributed-sessions
 		incoming:                    make(chan jsonrpc.Message, 10),
 		done:                        make(chan struct{}),
 		streams:                     make(map[string]*stream),
@@ -910,9 +1026,21 @@ type streamableServerConn struct {
 	server     *Server
 	toolLookup func(name string) (*serverTool, bool)
 
+	// FORK: distributed-sessions
+	onStateChange func(ctx context.Context, state ServerSessionState) error
+
+	// FORK: distributed-sessions
+	// onPublish routes messages when this pod is not the SSE owner.
+	onPublish func(ctx context.Context, sessionID string, msg []byte) error
+
+	// FORK: distributed-sessions
+	// sseOwned tracks whether this pod owns the standalone SSE stream.
+	// Protected by mu.
+	sseOwned bool
+
 	incoming chan jsonrpc.Message // messages from the client to the server
 
-	mu sync.Mutex // guards all fields below
+	mu sync.Mutex // guards all fields below (including sseOwned)
 
 	// Sessions are closed exactly once.
 	isDone bool
@@ -941,6 +1069,63 @@ type streamableServerConn struct {
 
 func (c *streamableServerConn) SessionID() string {
 	return c.sessionID
+}
+
+// FORK: distributed-sessions
+// sessionUpdated implements serverConnection to receive state change notifications.
+// This is called by ServerSession.updateState whenever the session state changes.
+func (c *streamableServerConn) sessionUpdated(ctx context.Context, state ServerSessionState) {
+	if c.onStateChange != nil {
+		// Run callback in goroutine to avoid blocking request processing.
+		go func() {
+			if err := c.onStateChange(ctx, state); err != nil {
+				c.logger.Error("state change callback failed", "error", err, "sessionID", c.sessionID)
+			}
+		}()
+	}
+}
+
+// FORK: distributed-sessions
+// writeToStandaloneSSE writes raw message data to the standalone SSE stream.
+// This is used by distributed session backends to forward messages from other pods.
+func (c *streamableServerConn) writeToStandaloneSSE(data []byte) error {
+	c.mu.Lock()
+	s := c.streams[""] // standalone SSE stream
+	sessionClosed := c.isDone
+	c.mu.Unlock()
+
+	if s == nil {
+		return fmt.Errorf("standalone SSE stream not available")
+	}
+	if sessionClosed {
+		return fmt.Errorf("session is closed")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.done == nil {
+		return fmt.Errorf("stream not connected")
+	}
+
+	// Store in eventStore before delivering
+	if c.eventStore != nil {
+		if err := c.eventStore.Append(context.Background(), c.sessionID, s.id, data); err != nil {
+			c.logger.Warn(fmt.Sprintf("failed to store routed message: %v", err))
+		}
+	}
+
+	// Compute eventID for SSE streams with event store
+	var eventID string
+	if c.eventStore != nil {
+		eventID = formatEventID(s.id, s.lastIdx+1)
+	}
+
+	if _, err := s.deliverLocked(data, eventID, jsonrpc.ID{}, 0); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // propagateCancellation implements [cancellationPropagator]. It returns true
@@ -1220,7 +1405,8 @@ func (t *StreamableServerTransport) ServeHTTP(w http.ResponseWriter, req *http.R
 	}
 	switch req.Method {
 	case http.MethodGet:
-		t.connection.serveGET(w, req)
+		// FORK: distributed-sessions - pass OnSSEStart callback
+		t.connection.serveGET(w, req, t.OnSSEStart)
 	case http.MethodPost:
 		t.connection.servePOST(w, req)
 	default:
@@ -1235,7 +1421,7 @@ func (t *StreamableServerTransport) ServeHTTP(w http.ResponseWriter, req *http.R
 // message parsed from the Last-Event-ID header.
 //
 // It returns an HTTP status code and error message.
-func (c *streamableServerConn) serveGET(w http.ResponseWriter, req *http.Request) {
+func (c *streamableServerConn) serveGET(w http.ResponseWriter, req *http.Request, onSSEStart func(ctx context.Context, writer func(data []byte) error, closeSSE func())) {
 	// streamID "" corresponds to the default GET request.
 	streamID := ""
 	// By default, we haven't seen a last index. Since indices start at 0, we represent
@@ -1267,7 +1453,39 @@ func (c *streamableServerConn) serveGET(w http.ResponseWriter, req *http.Request
 		return
 	}
 	defer stream.release()
-	c.hangResponse(ctx, done)
+
+	// FORK: distributed-sessions - track SSE ownership for standalone stream
+	if streamID == "" {
+		c.mu.Lock()
+		c.sseOwned = true
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			c.sseOwned = false
+			c.mu.Unlock()
+		}()
+	}
+
+	// FORK: distributed-sessions - notify that SSE stream is established
+	// We use a derived context so that the callback can close the SSE
+	// stream by calling closeSSE (which cancels the context).
+	sseCtx, sseCancel := context.WithCancel(ctx)
+	defer sseCancel()
+
+	if onSSEStart != nil && streamID == "" {
+		// Create a writer function that writes to the standalone SSE stream
+		writer := func(data []byte) error {
+			return c.writeToStandaloneSSE(data)
+		}
+		// closeSSE cancels the SSE context, causing hangResponse to return
+		closeSSE := func() {
+			sseCancel()
+		}
+		// Run callback in goroutine - it may block (e.g., subscription loop)
+		go onSSEStart(sseCtx, writer, closeSSE)
+	}
+
+	c.hangResponse(sseCtx, done)
 }
 
 // hangResponse blocks the HTTP response until one of three conditions is met:
@@ -1862,6 +2080,7 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 
 	// Write the message to the stream.
 	var s *stream
+	var isStandaloneSSE bool
 	c.mu.Lock()
 	if relatedRequest.IsValid() {
 		if streamID, ok := c.requestStreams[relatedRequest]; ok {
@@ -1879,6 +2098,7 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 		}
 		if s == nil {
 			s = c.streams[""] // standalone SSE stream
+			isStandaloneSSE = true
 		}
 	}
 	if responseTo.IsValid() {
@@ -1887,6 +2107,7 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 		delete(c.requestStreams, responseTo)
 	}
 	sessionClosed := c.isDone
+	sseOwned := c.sseOwned // FORK: distributed-sessions - capture ownership state
 	c.mu.Unlock()
 
 	if s == nil {
@@ -1899,6 +2120,17 @@ func (c *streamableServerConn) Write(ctx context.Context, msg jsonrpc.Message) e
 	}
 	if sessionClosed {
 		return errors.New("session is closed")
+	}
+
+	// FORK: distributed-sessions - route via backend if we don't own SSE stream.
+	// If no backend is configured, fall back to local delivery so event replay
+	// can still capture messages for a reconnecting client.
+	if isStandaloneSSE && !sseOwned && c.onPublish != nil {
+		if err := c.onPublish(ctx, c.sessionID, data); err != nil {
+			return fmt.Errorf("%w: publish failed: %v", jsonrpc2.ErrRejected, err)
+		}
+		// Message routed to SSE owner via backend; don't write locally
+		return nil
 	}
 
 	s.mu.Lock()
