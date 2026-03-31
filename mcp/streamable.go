@@ -713,6 +713,11 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 		sessionID = server.opts.GetSessionID()
 	}
 
+	// FORK: distributed-sessions - extract userID early so callbacks can capture it
+	var userID string
+	if tokenInfo := auth.TokenInfoFromContext(req.Context()); tokenInfo != nil {
+		userID = tokenInfo.UserID
+	}
 	transport := &StreamableServerTransport{
 		SessionID:    sessionID,
 		Stateless:    false,
@@ -741,7 +746,7 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 			// Use a timeout derived from the request context.
 			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			return h.updateSessionStateInBackend(ctx, sessionID, &state)
+			return h.updateSessionStateInBackend(ctx, sessionID, userID, &state)
 		}
 		// FORK: distributed-sessions - route messages when not SSE owner
 		transport.OnPublish = func(ctx context.Context, sid string, msg []byte) error {
@@ -781,10 +786,13 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 				delete(h.sessions, transport.SessionID)
 				// FORK: distributed-sessions - cleanup backend
 				if h.hasSessionBackend() {
-					// Use background context since the request context may be done
-					if err := h.deleteSessionFromBackend(context.Background(), transport.SessionID); err != nil {
+					// Use background context since the request context may be done.
+					// Add a timeout to avoid blocking indefinitely if the backend is slow.
+					deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if err := h.deleteSessionFromBackend(deleteCtx, transport.SessionID); err != nil {
 						h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", transport.SessionID)
 					}
+					deleteCancel()
 				}
 				if h.onTransportDeletion != nil {
 					h.onTransportDeletion(transport.SessionID)
@@ -801,12 +809,6 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 		h.opts.Logger.Error(fmt.Sprintf("failed to connect: %v", err))
 		http.Error(w, "failed connection", http.StatusInternalServerError)
 		return
-	}
-	// Capture the user ID from the token info to enable session hijacking
-	// prevention on subsequent requests.
-	var userID string
-	if tokenInfo := auth.TokenInfoFromContext(req.Context()); tokenInfo != nil {
-		userID = tokenInfo.UserID
 	}
 	sessInfo := &sessionInfo{
 		session:   session,
