@@ -214,12 +214,13 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 	}
 
 	// Set up state persistence: when state changes, persist to backend
+	backendUserID := data.UserID
 	transport.OnStateChange = func(ctx context.Context, state ServerSessionState) error {
 		// This callback blocks - it runs in a goroutine spawned by the caller.
 		// Use a timeout derived from the request context.
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		return h.updateSessionStateInBackend(ctx, sessionID, &state)
+		return h.updateSessionStateInBackend(ctx, sessionID, backendUserID, &state)
 	}
 
 	// Set up message routing: route messages when not SSE owner
@@ -291,18 +292,19 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 
 // updateSessionStateInBackend persists session state changes to the backend.
 // This should be called when session state changes (e.g., after Initialize).
-func (h *StreamableHTTPHandler) updateSessionStateInBackend(ctx context.Context, sessionID string, state *ServerSessionState) error {
+//
+// FORK: distributed-sessions - This uses a direct Update with reconstructed
+// SessionData instead of a read-modify-write cycle to avoid race conditions
+// when multiple goroutines or pods update state concurrently.
+func (h *StreamableHTTPHandler) updateSessionStateInBackend(ctx context.Context, sessionID string, userID string, state *ServerSessionState) error {
 	if !h.hasSessionBackend() {
 		return nil
 	}
 
-	// Get current data
-	data, err := h.opts.SessionBackend.Get(ctx, sessionID)
-	if err != nil {
-		return err
+	data := &SessionData{
+		SessionID: sessionID,
+		State:     state,
+		UserID:    userID,
 	}
-
-	// Update state
-	data.State = state
 	return h.opts.SessionBackend.Update(ctx, sessionID, data)
 }
