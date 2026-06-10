@@ -1102,6 +1102,11 @@ type ServerSession struct {
 	calledOnClose atomic.Bool
 	onClose       func()
 
+	// closeReason carries why the session is closing (a CloseReason) so the
+	// onClose callback can route it to the SessionBackend. Set by
+	// closeWithReason before Close triggers onClose; first reason wins.
+	closeReason atomic.Int32
+
 	server          *Server
 	conn            *jsonrpc2.Connection
 	mcpConn         Connection
@@ -1498,6 +1503,15 @@ func (ss *ServerSession) setLevel(ctx context.Context, params *SetLoggingLevelPa
 //
 // Close is idempotent and concurrency safe.
 func (ss *ServerSession) Close() error {
+	return ss.closeWithReason(CloseReasonUnknown)
+}
+
+// closeWithReason records why the session is closing and then closes it. The
+// reason is delivered to the onClose callback (and thus to a
+// SessionCloseNotifier backend). The first reason recorded wins, mirroring the
+// at-most-once onClose semantics.
+func (ss *ServerSession) closeWithReason(reason CloseReason) error {
+	ss.closeReason.CompareAndSwap(int32(CloseReasonUnknown), int32(reason))
 	if ss.keepaliveCancel != nil {
 		// Note: keepaliveCancel access is safe without a mutex because:
 		// 1. keepaliveCancel is only written once during startKeepalive (happens-before all Close calls)

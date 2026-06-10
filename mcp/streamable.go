@@ -240,7 +240,7 @@ func (h *StreamableHTTPHandler) closeAll() {
 	h.sessions = nil
 	h.mu.Unlock()
 	for _, s := range sessionInfos {
-		s.session.Close()
+		s.session.closeWithReason(CloseReasonShutdown)
 	}
 }
 
@@ -353,8 +353,8 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 		}
 		if sessInfo != nil { // sessInfo may be nil in stateless mode
 			// Closing the session also removes it from h.sessions, due to the
-			// onClose callback.
-			sessInfo.session.Close()
+			// onClose callback. ClientDelete authorizes a distributed backend delete.
+			sessInfo.session.closeWithReason(CloseReasonClientDelete)
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -554,16 +554,12 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 					if info, ok := h.sessions[transport.SessionID]; ok {
 						info.stopTimer()
 						delete(h.sessions, transport.SessionID)
-						// FORK: distributed-sessions - cleanup backend
-						if h.hasSessionBackend() {
-							// Use background context since the request context may be done.
-							// Add a timeout to avoid blocking indefinitely if the backend is slow.
-							deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
-							if err := h.deleteSessionFromBackend(deleteCtx, transport.SessionID); err != nil {
-								h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", transport.SessionID)
-							}
-							deleteCancel()
-						}
+						// FORK: distributed-sessions - notify backend of close.
+						// A SessionCloseNotifier backend decides per-reason whether
+						// to remove shared state; a plain backend falls back to the
+						// historical unconditional delete for locally-created sessions.
+						reason := CloseReason(info.session.closeReason.Load())
+						h.notifySessionClose(transport.SessionID, reason, true /* fallbackDelete */)
 						if h.onTransportDeletion != nil {
 							h.onTransportDeletion(transport.SessionID)
 						}
@@ -599,7 +595,7 @@ func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 			if h.opts.SessionTimeout > 0 {
 				sessInfo.timeout = h.opts.SessionTimeout
 				sessInfo.timer = time.AfterFunc(sessInfo.timeout, func() {
-					sessInfo.session.Close()
+					sessInfo.session.closeWithReason(CloseReasonIdleTimeout)
 				})
 			}
 			h.mu.Lock()

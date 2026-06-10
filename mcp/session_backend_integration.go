@@ -105,6 +105,33 @@ func (h *StreamableHTTPHandler) deleteSessionFromBackend(ctx context.Context, se
 	return h.opts.SessionBackend.Delete(ctx, sessionID)
 }
 
+// notifySessionClose informs the backend that a local session closed. When the
+// backend implements SessionCloseNotifier it receives the close reason and
+// decides whether to remove shared state. Otherwise the handler preserves the
+// historical behavior: locally-created sessions (fallbackDelete) are deleted
+// from the backend; restored sessions are not.
+func (h *StreamableHTTPHandler) notifySessionClose(sessionID string, reason CloseReason, fallbackDelete bool) {
+	if !h.hasSessionBackend() {
+		return
+	}
+	// Use a background context with a timeout: the request context may be done.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if n, ok := h.opts.SessionBackend.(SessionCloseNotifier); ok {
+		if err := n.OnSessionClose(ctx, sessionID, reason); err != nil {
+			h.opts.Logger.Error("session close notification failed", "error", err, "sessionID", sessionID, "reason", reason.String())
+		}
+		return
+	}
+
+	if fallbackDelete {
+		if err := h.deleteSessionFromBackend(ctx, sessionID); err != nil {
+			h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", sessionID)
+		}
+	}
+}
+
 // touchSessionInBackend updates the session's last activity timestamp.
 func (h *StreamableHTTPHandler) touchSessionInBackend(ctx context.Context, sessionID string) error {
 	if !h.hasSessionBackend() {
@@ -247,11 +274,15 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 			if info, ok := h.sessions[sessionID]; ok {
 				info.stopTimer()
 				delete(h.sessions, sessionID)
+				// FORK: distributed-sessions - notify the backend so it can run
+				// its own close handling (e.g. unregister hub state). Pass
+				// fallbackDelete=false: a restored session may be live on another
+				// pod, so a non-notifier backend must NOT delete shared state here.
+				reason := CloseReason(info.session.closeReason.Load())
+				h.notifySessionClose(sessionID, reason, false /* fallbackDelete */)
 				if h.onTransportDeletion != nil {
 					h.onTransportDeletion(sessionID)
 				}
-				// Note: We don't delete from backend here - the session might
-				// be accessed by another pod. Let TTL or explicit DELETE handle it.
 			}
 		},
 	}
@@ -271,7 +302,7 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 	if h.opts.SessionTimeout > 0 {
 		sessInfo.timeout = h.opts.SessionTimeout
 		sessInfo.timer = time.AfterFunc(sessInfo.timeout, func() {
-			sessInfo.session.Close()
+			sessInfo.session.closeWithReason(CloseReasonIdleTimeout)
 		})
 	}
 

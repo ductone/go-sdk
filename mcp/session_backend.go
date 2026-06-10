@@ -18,6 +18,61 @@ import (
 // failover when a new pod claims ownership of the session.
 var ErrSubscriptionSuperseded = errors.New("mcp: subscription superseded")
 
+// CloseReason explains why a local ServerSession is being closed. It is
+// delivered to a SessionBackend that implements SessionCloseNotifier so the
+// backend can distinguish an authoritative, distributed teardown from a merely
+// local eviction that must NOT remove shared state.
+type CloseReason int
+
+const (
+	// CloseReasonUnknown is the default when no specific reason was supplied
+	// (e.g. a direct ServerSession.Close call). Backends should treat it as a
+	// local eviction and must not assume the distributed session is gone.
+	CloseReasonUnknown CloseReason = iota
+	// CloseReasonClientDelete means the client sent an HTTP DELETE for the
+	// session. This is the only reason that authorizes deleting the
+	// distributed (shared) session.
+	CloseReasonClientDelete
+	// CloseReasonIdleTimeout means SessionTimeout elapsed with no local
+	// activity. The session may still be live on another replica, so the
+	// backend must only evict local state.
+	CloseReasonIdleTimeout
+	// CloseReasonShutdown means the handler is shutting down all sessions.
+	// Like IdleTimeout, this is a local eviction, not a distributed delete.
+	CloseReasonShutdown
+)
+
+func (r CloseReason) String() string {
+	switch r {
+	case CloseReasonClientDelete:
+		return "client_delete"
+	case CloseReasonIdleTimeout:
+		return "idle_timeout"
+	case CloseReasonShutdown:
+		return "shutdown"
+	default:
+		return "unknown"
+	}
+}
+
+// SessionCloseNotifier is an optional interface a SessionBackend may implement
+// to be notified when a local ServerSession for a distributed session closes,
+// along with the reason for the close.
+//
+// When the SessionBackend implements this interface, the handler calls
+// OnSessionClose instead of Delete on local session close (for both
+// locally-created and restored sessions). The backend inspects the reason and
+// decides whether to remove shared state: a CloseReasonClientDelete is an
+// authoritative teardown, while CloseReasonIdleTimeout / CloseReasonShutdown
+// are local evictions for a session that may be live on another replica.
+//
+// Backends that do not implement this interface retain the prior behavior:
+// locally-created sessions are deleted from the backend on close; restored
+// sessions are not.
+type SessionCloseNotifier interface {
+	OnSessionClose(ctx context.Context, sessionID string, reason CloseReason) error
+}
+
 // ErrSessionNotFound is returned when a session lookup fails because the
 // session does not exist in the backend.
 var ErrSessionNotFound = errors.New("mcp: session not found")
