@@ -481,6 +481,15 @@ type RequestExtra struct {
 	TokenInfo *auth.TokenInfo // bearer token info (e.g. from OAuth) if any
 	Header    http.Header     // header from HTTP request, if any
 
+	// RequestContext is the originating HTTP request's context, if any. Server
+	// sessions dispatch incoming messages on the session's connection context,
+	// not the per-request HTTP context, so request-scoped values set by HTTP
+	// middleware (auth principals, loggers, trace spans) do not otherwise reach
+	// method handlers. Read request-scoped values from here (e.g. in receiving
+	// middleware) and propagate them onto the handler context. Use it for its
+	// values only; its cancellation and deadline are not the handler's.
+	RequestContext context.Context //nolint:containedctx // request-scoped transport metadata, mirrors Header
+
 	// If set, CloseSSEStream explicitly closes the current SSE request stream.
 	//
 	// [SEP-1699] introduced server-side SSE stream disconnection: for
