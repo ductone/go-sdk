@@ -20,7 +20,8 @@ For an upstream refresh:
 The initial integration PR ports the distributed-session backend, originating
 request context, synchronous initialize persistence, and stateful discovery
 guard from the earlier fork stack. The restored-session eviction callback is
-a separate follow-up; it is not part of that initial port.
+a separate follow-up. It notifies embedding applications after a restored
+session is removed locally, without deleting shared backend state.
 
 Run `go test ./...` and `go build ./...` for the SDK. For distributed-session
 changes, also run the focused race checks:
