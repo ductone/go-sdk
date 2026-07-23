@@ -163,6 +163,16 @@ type StreamableHTTPOptions struct {
 	// upon stream resumption.
 	EventStore EventStore
 
+	// OnSessionEvicted, if set, is called after a session that was created
+	// from backend state (a cross-pod restore) is closed and removed from this
+	// handler's local session cache — by idle timeout or an explicit DELETE.
+	// The backend record is deliberately NOT deleted on that path (another pod
+	// may still own the live session), so embedding applications that mirror
+	// sessions in per-pod state need this signal to release their mirror.
+	//
+	// FORK: distributed-sessions.
+	OnSessionEvicted func(sessionID string)
+
 	// SessionTimeout configures a timeout for idle sessions.
 	//
 	// When sessions receive no new HTTP requests from the client for this
