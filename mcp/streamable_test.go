@@ -874,6 +874,29 @@ func TestStreamableServerTransport(t *testing.T) {
 					wantStatusCode: http.StatusOK,
 					wantMessages:   []jsonrpc.Message{resp(5, &CallToolResult{Content: []Content{}}, nil)},
 				},
+				{
+					// Parameters without a space separator should pass.
+					method:         "POST",
+					headers:        http.Header{"Content-Type": {"application/json;charset=utf-8"}},
+					messages:       []jsonrpc.Message{req(6, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode: http.StatusOK,
+					wantMessages:   []jsonrpc.Message{resp(6, &CallToolResult{Content: []Content{}}, nil)},
+				},
+				{
+					// Media types are case-insensitive.
+					method:         "POST",
+					headers:        http.Header{"Content-Type": {"Application/JSON"}},
+					messages:       []jsonrpc.Message{req(7, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode: http.StatusOK,
+					wantMessages:   []jsonrpc.Message{resp(7, &CallToolResult{Content: []Content{}}, nil)},
+				},
+				{
+					// A parameterized non-JSON media type should still be rejected.
+					method:         "POST",
+					headers:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+					messages:       []jsonrpc.Message{req(8, "tools/call", &CallToolParams{Name: "tool"})},
+					wantStatusCode: http.StatusUnsupportedMediaType,
+				},
 			},
 			wantSessions: 1,
 		},
