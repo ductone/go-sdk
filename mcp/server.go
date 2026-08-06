@@ -5,11 +5,9 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -881,7 +879,7 @@ func (s *Server) getPrompt(ctx context.Context, req *GetPromptRequest) (*GetProm
 // the server's capabilities, the server's identity, and the server's
 // instructions, allowing clients to negotiate without performing the legacy
 // initialize handshake.
-func (s *Server) discover(_ context.Context, req *ServerRequest[*DiscoverParams]) (*DiscoverResult, error) {
+func (s *Server) discover(ctx context.Context, req *ServerRequest[*DiscoverParams]) (*DiscoverResult, error) {
 	req.Session.mu.Lock()
 	versions := req.Session.supportedVersions
 	req.Session.mu.Unlock()
@@ -904,7 +902,7 @@ func (s *Server) discover(_ context.Context, req *ServerRequest[*DiscoverParams]
 	// InitializeParams nil lets serveStatefulPOST's safety-net cleanup
 	// close it instead of leaking.
 	if supportedVersion := negotiateMutuallySupportedVersion(versions); supportedVersion >= protocolVersion20260728 {
-		req.Session.updateState(func(state *ServerSessionState) {
+		req.Session.updateState(ctx, func(state *ServerSessionState) {
 			state.InitializeParams = init
 		})
 	}
@@ -1415,7 +1413,7 @@ func (ss *ServerSession) initialized(ctx context.Context, params *InitializedPar
 		params = new(InitializedParams)
 	}
 	var wasInit, wasInitd bool
-	ss.updateState(func(state *ServerSessionState) {
+	ss.updateState(ctx, func(state *ServerSessionState) {
 		wasInit = state.InitializeParams != nil
 		wasInitd = state.InitializedParams != nil
 		if wasInit && !wasInitd {
@@ -1499,13 +1497,14 @@ type ServerSession struct {
 	state ServerSessionState
 }
 
-func (ss *ServerSession) updateState(mut func(*ServerSessionState)) {
+// FORK: distributed-sessions - added ctx parameter
+func (ss *ServerSession) updateState(ctx context.Context, mut func(*ServerSessionState)) {
 	ss.mu.Lock()
 	mut(&ss.state)
 	copy := ss.state
 	ss.mu.Unlock()
 	if c, ok := ss.mcpConn.(serverConnection); ok {
-		c.sessionUpdated(copy)
+		c.sessionUpdated(ctx, copy)
 	}
 }
 
@@ -1909,7 +1908,7 @@ func (ss *ServerSession) handle(ctx context.Context, req *jsonrpc.Request) (any,
 			return nil, fmt.Errorf("method %q is invalid during session initialization", req.Method)
 		}
 		if !initialized && validatedMeta.usesNewProtocol && validatedMeta.initializeParams != nil {
-			ss.updateState(func(state *ServerSessionState) {
+			ss.updateState(ctx, func(state *ServerSessionState) {
 				state.InitializeParams = validatedMeta.initializeParams
 			})
 		}
@@ -1975,7 +1974,7 @@ func (ss *ServerSession) initialize(ctx context.Context, params *InitializeParam
 		return nil, fmt.Errorf("%w: \"params\" must be be provided", jsonrpc2.ErrInvalidParams)
 	}
 	var wasInit bool
-	ss.updateState(func(state *ServerSessionState) {
+	ss.updateState(ctx, func(state *ServerSessionState) {
 		wasInit = state.InitializeParams != nil
 		if !wasInit {
 			state.InitializeParams = params
@@ -2010,8 +2009,8 @@ func (ss *ServerSession) cancel(context.Context, *CancelledParams) (Result, erro
 	return nil, nil
 }
 
-func (ss *ServerSession) setLevel(_ context.Context, params *SetLoggingLevelParams) (*emptyResult, error) {
-	ss.updateState(func(state *ServerSessionState) {
+func (ss *ServerSession) setLevel(ctx context.Context, params *SetLoggingLevelParams) (*emptyResult, error) {
+	ss.updateState(ctx, func(state *ServerSessionState) {
 		state.LogLevel = params.Level
 	})
 	ss.server.opts.Logger.Info("client log level set", "level", params.Level)
@@ -2053,21 +2052,20 @@ func (ss *ServerSession) startKeepalive(interval time.Duration) {
 }
 
 // pageToken is the internal structure for the opaque pagination cursor.
-// It will be Gob-encoded and then Base64-encoded for use as a string token.
+// It will be JSON-encoded and then Base64-encoded for use as a string token.
 type pageToken struct {
-	LastUID string // The unique ID of the last resource seen.
+	LastUID string `json:"last_uid"` // The unique ID of the last resource seen.
 }
 
 // encodeCursor encodes a unique identifier (UID) into a opaque pagination cursor
 // by serializing a pageToken struct.
 func encodeCursor(uid string) (string, error) {
-	var buf bytes.Buffer
 	token := pageToken{LastUID: uid}
-	encoder := gob.NewEncoder(&buf)
-	if err := encoder.Encode(token); err != nil {
+	encodedBytes, err := json.Marshal(token)
+	if err != nil {
 		return "", fmt.Errorf("failed to encode page token: %w", err)
 	}
-	return base64.URLEncoding.EncodeToString(buf.Bytes()), nil
+	return base64.URLEncoding.EncodeToString(encodedBytes), nil
 }
 
 // decodeCursor decodes an opaque pagination cursor into the original pageToken struct.
@@ -2078,9 +2076,7 @@ func decodeCursor(cursor string) (*pageToken, error) {
 	}
 
 	var token pageToken
-	buf := bytes.NewBuffer(decodedBytes)
-	decoder := gob.NewDecoder(buf)
-	if err := decoder.Decode(&token); err != nil {
+	if err := json.Unmarshal(decodedBytes, &token); err != nil {
 		return nil, fmt.Errorf("failed to decode page token: %w, cursor: %v", err, cursor)
 	}
 	return &token, nil

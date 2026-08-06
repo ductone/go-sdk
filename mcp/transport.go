@@ -106,7 +106,7 @@ type clientConnection interface {
 // TODO: should this interface be exported?
 type serverConnection interface {
 	Connection
-	sessionUpdated(ServerSessionState)
+	sessionUpdated(ctx context.Context, state ServerSessionState) // FORK: distributed-sessions - added ctx
 }
 
 // A StdioTransport is a [Transport] that communicates over stdin/stdout using
@@ -496,7 +496,7 @@ func newIOConn(rwc io.ReadWriteCloser) *ioConn {
 
 func (c *ioConn) SessionID() string { return "" }
 
-func (c *ioConn) sessionUpdated(state ServerSessionState) {
+func (c *ioConn) sessionUpdated(_ context.Context, state ServerSessionState) { // FORK: distributed-sessions - added ctx
 	protocolVersion := ""
 	if state.InitializeParams != nil {
 		protocolVersion = state.InitializeParams.ProtocolVersion
