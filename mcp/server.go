@@ -1495,6 +1495,26 @@ type ServerSession struct {
 
 	mu    sync.Mutex
 	state ServerSessionState
+
+	// FORK: session-close-listen-deadlock (TEMPORARY) - listenIDs holds the
+	// request IDs of in-flight subscriptions/listen handlers on this
+	// session, and closing marks that Close has begun. Both are guarded by
+	// mu so registration (in handle) and shutdown (in Close) can never
+	// race: a listen request either registers before closing is set, in
+	// which case Close's snapshot below is guaranteed to include it
+	// (registration happens-before under the same mutex), or it observes
+	// closing already true and self-cancels immediately instead of
+	// registering -- there is no window where a listen handler is neither
+	// captured by Close's snapshot nor self-cancelling.
+	//
+	// subscriptions/listen parks on ctx.Done until cancelled, so
+	// ServerSession.Close must cancel these contexts explicitly via
+	// jsonrpc2.Connection.Cancel to avoid deadlocking on the jsonrpc2 drain.
+	// See modelcontextprotocol/go-sdk#1160 (fix proposed, unmerged, in #1166).
+	// Remove this field and its call sites once the fork re-syncs to an
+	// upstream revision that includes the merged fix.
+	listenIDs []jsonrpc.ID
+	closing   bool
 }
 
 // FORK: distributed-sessions - added ctx parameter
@@ -1508,6 +1528,36 @@ func (ss *ServerSession) updateState(ctx context.Context, mut func(*ServerSessio
 	}
 }
 
+// FORK: session-close-listen-deadlock (TEMPORARY) - trackListen registers a
+// newly-received subscriptions/listen request's ID so Close can cancel it.
+// It returns true when the caller must cancel the request itself instead:
+// Close has already begun (closing is set) and its listenIDs snapshot has
+// already been taken under the same mutex, so it will never observe an ID
+// registered afterward. This -- together with Close's own critical section
+// -- guarantees every subscriptions/listen request is cancelled exactly
+// once, with no window where a registered ID is missed. See
+// modelcontextprotocol/go-sdk#1160. Remove once the fork re-syncs to an
+// upstream revision that includes the merged fix (modelcontextprotocol/go-sdk#1166).
+func (ss *ServerSession) trackListen(id jsonrpc.ID) (selfCancel bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.closing {
+		return true
+	}
+	ss.listenIDs = append(ss.listenIDs, id)
+	return false
+}
+
+// FORK: session-close-listen-deadlock (TEMPORARY) - untrackListen removes a
+// completed, cancelled, or self-cancelled subscriptions/listen request's ID
+// so repeated subscribe/unsubscribe cycles cannot retain stale entries.
+func (ss *ServerSession) untrackListen(id jsonrpc.ID) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.listenIDs = slices.DeleteFunc(ss.listenIDs, func(x jsonrpc.ID) bool { return x == id })
+}
+
+// hasInitialized reports whether the server has received the initialized
 // hasInitialized reports whether the server has received the initialized
 // notification.
 //
@@ -2031,6 +2081,25 @@ func (ss *ServerSession) Close() error {
 		// 3. The keepalive goroutine calls Close on ping failure, but this is safe since
 		//    Close is idempotent and conn.Close() handles concurrent calls correctly
 		ss.keepaliveCancel()
+	}
+	// FORK: session-close-listen-deadlock (TEMPORARY) - mark closing and
+	// unblock any in-flight subscriptions/listen handlers, which otherwise
+	// park on ctx.Done and would deadlock ss.conn.Close (which waits for
+	// in-flight requests to drain before it tears down the connection).
+	// Setting closing under the same lock trackListen checks closes the
+	// registration race: a listen request that hasn't registered yet by
+	// the time this snapshot runs will observe closing=true and cancel
+	// itself instead (see trackListen). Mirrors the fix proposed upstream
+	// in modelcontextprotocol/go-sdk#1166 (unmerged as of 2026-08-15).
+	// Remove once the fork re-syncs to a revision that includes the merged
+	// fix.
+	ss.mu.Lock()
+	ss.closing = true
+	listenIDs := ss.listenIDs
+	ss.listenIDs = nil
+	ss.mu.Unlock()
+	for _, id := range listenIDs {
+		ss.conn.Cancel(id)
 	}
 	err := ss.conn.Close()
 
