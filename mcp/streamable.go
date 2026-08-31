@@ -1771,10 +1771,7 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 				// Extract again the protcol version from the context to see what the client
 				// is advertising in the Mcp-Protocol-Version HTTP header.
 				headerVersion := protocolVersionFromContext(req.Context())
-				// server/discover is exempt from the stateful
-				// rejection as it should learn about the supported protocols from the
-				// DiscoverResult response.
-				if !c.stateless && jreq.Method != methodDiscover {
+				if !c.stateless {
 					if plaintextstatefulrejection == "1" {
 						http.Error(w, fmt.Sprintf(
 							"Bad Request: protocol version %q is only supported on stateless HTTP servers (set StreamableHTTPOptions.Stateless = true)",
