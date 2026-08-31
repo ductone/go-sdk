@@ -949,12 +949,14 @@ type StreamableServerTransport struct {
 	OnSSEStart func(ctx context.Context, writer func(data []byte) error, closeSSE func())
 
 	// FORK: distributed-sessions
-	// OnStateChange is called in a goroutine when the session state changes
-	// (e.g., after Initialize, setLogLevel). This allows the handler to persist
-	// state to the SessionBackend.
+	// OnStateChange is called when the session state changes (e.g., after
+	// Initialize, setLogLevel). This allows the handler to persist state to the
+	// SessionBackend.
 	//
-	// The callback receives the request context and may block.
-	// It will be called in its own goroutine by the SDK.
+	// The callback receives the request context and may block. It is called
+	// synchronously on the request goroutine for the initialize state transition,
+	// so the initialize response is not flushed until the session is durable in
+	// the backend; all other state changes are dispatched in their own goroutine.
 	// Return nil to indicate success, or an error which will be logged.
 	OnStateChange func(ctx context.Context, state ServerSessionState) error
 
@@ -1076,15 +1078,37 @@ func (c *streamableServerConn) SessionID() string {
 // FORK: distributed-sessions
 // sessionUpdated implements serverConnection to receive state change notifications.
 // This is called by ServerSession.updateState whenever the session state changes.
+//
+// The persist for the initialize state transition runs synchronously so the
+// initialize response is not flushed to the client until the session is durable
+// in the backend. Otherwise a spec-compliant client's follow-up request, which a
+// multi-pod deployment may load-balance to a pod that has not yet observed the
+// async write, reconstructs a session with a nil InitializeParams and is rejected
+// as "invalid during session initialization". All other state changes (list-changed
+// notifications, log level) stay on the goroutine to keep backend latency off the
+// hot path.
 func (c *streamableServerConn) sessionUpdated(ctx context.Context, state ServerSessionState) {
-	if c.onStateChange != nil {
-		// Run callback in goroutine to avoid blocking request processing.
-		go func() {
-			if err := c.onStateChange(ctx, state); err != nil {
-				c.logger.Error("state change callback failed", "error", err, "sessionID", c.sessionID)
-			}
-		}()
+	if c.onStateChange == nil {
+		return
 	}
+	// The initialize request sets InitializeParams; the later initialized
+	// notification sets InitializedParams. The transition in between is the one
+	// whose durability must gate the initialize response.
+	if state.InitializeParams != nil && state.InitializedParams == nil {
+		if err := c.onStateChange(ctx, state); err != nil {
+			// Best-effort on persist failure: log and proceed rather than fail the
+			// initialize request. The residual race on a backend outage is the same
+			// one that exists without this synchronous persist.
+			c.logger.Error("initialize state change callback failed", "error", err, "sessionID", c.sessionID)
+		}
+		return
+	}
+	// Run callback in goroutine to avoid blocking request processing.
+	go func() {
+		if err := c.onStateChange(ctx, state); err != nil {
+			c.logger.Error("state change callback failed", "error", err, "sessionID", c.sessionID)
+		}
+	}()
 }
 
 // FORK: distributed-sessions
