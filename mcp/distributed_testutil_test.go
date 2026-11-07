@@ -565,7 +565,7 @@ func (s *SSEStream) readEvents() {
 		s.resp.Body.Close()
 	}()
 
-	for evt, err := range scanEvents(s.resp.Body) {
+	for evt, err := range scanEventsLimited(s.resp.Body, DefaultMaxEventSize) {
 		if err != nil {
 			select {
 			case s.errors <- err:
