@@ -368,7 +368,7 @@ func TestIOConnRead(t *testing.T) {
 				if requested == "" {
 					requested = tt.protocolVersion
 				}
-				tr.serverSessionUpdated(ServerSessionState{
+				tr.serverSessionUpdated(context.Background(), ServerSessionState{
 					InitializeParams: &InitializeParams{
 						ProtocolVersion: requested,
 					},
@@ -731,7 +731,7 @@ func TestIOConnDropResponse(t *testing.T) {
 				wc: nopCloserWriter{&out},
 			})
 			t.Cleanup(func() { tr.Close() })
-			tr.serverSessionUpdated(ServerSessionState{NegotiatedProtocolVersion: test.version})
+			tr.serverSessionUpdated(context.Background(), ServerSessionState{NegotiatedProtocolVersion: test.version})
 
 			if test.drop {
 				tr.DropResponse(jsonrpc2.Int64ID(1))
@@ -974,8 +974,10 @@ type optionalConn struct {
 }
 
 func (c *optionalConn) clientSessionUpdated(s clientSessionState) { c.clientState = &s }
-func (c *optionalConn) serverSessionUpdated(s ServerSessionState) { c.serverState = &s }
-func (c *optionalConn) propagateCancellation() bool               { return true }
+func (c *optionalConn) serverSessionUpdated(_ context.Context, s ServerSessionState) {
+	c.serverState = &s
+}
+func (c *optionalConn) propagateCancellation() bool { return true }
 
 // TestLoggingConnForwardsOptionalInterfaces verifies that loggingConn forwards
 // the optional connection interfaces to its delegate, and is a no-op for a
@@ -988,7 +990,7 @@ func TestLoggingConnForwardsOptionalInterfaces(t *testing.T) {
 	if delegate.clientState == nil || delegate.clientState.InitializeResult.ProtocolVersion != protocolVersion20251125 {
 		t.Errorf("clientSessionUpdated was not forwarded: got %+v", delegate.clientState)
 	}
-	lc.serverSessionUpdated(ServerSessionState{NegotiatedProtocolVersion: protocolVersion20251125})
+	lc.serverSessionUpdated(context.Background(), ServerSessionState{NegotiatedProtocolVersion: protocolVersion20251125})
 	if delegate.serverState == nil || delegate.serverState.NegotiatedProtocolVersion != protocolVersion20251125 {
 		t.Errorf("serverSessionUpdated was not forwarded: got %+v", delegate.serverState)
 	}
@@ -998,7 +1000,7 @@ func TestLoggingConnForwardsOptionalInterfaces(t *testing.T) {
 
 	plain := &loggingConn{delegate: struct{ Connection }{}, w: io.Discard}
 	plain.clientSessionUpdated(clientSessionState{})
-	plain.serverSessionUpdated(ServerSessionState{})
+	plain.serverSessionUpdated(context.Background(), ServerSessionState{})
 	if plain.propagateCancellation() {
 		t.Error("propagateCancellation() = true for a delegate without the interface, want false")
 	}

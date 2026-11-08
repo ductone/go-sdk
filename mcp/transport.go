@@ -116,7 +116,7 @@ type serverConnection interface {
 	Connection
 
 	// serverSessionUpdated is called whenever the server session state changes.
-	serverSessionUpdated(ServerSessionState)
+	serverSessionUpdated(context.Context, ServerSessionState)
 }
 
 // DefaultMaxLineLength is the default maximum number of bytes buffered while
@@ -492,9 +492,9 @@ func (s *loggingConn) clientSessionUpdated(state clientSessionState) {
 
 // serverSessionUpdated forwards to the delegate, whose behavior may depend on
 // the negotiated protocol version (see [ioConn.DropResponse]).
-func (s *loggingConn) serverSessionUpdated(state ServerSessionState) {
+func (s *loggingConn) serverSessionUpdated(ctx context.Context, state ServerSessionState) {
 	if c, ok := s.delegate.(serverConnection); ok {
-		c.serverSessionUpdated(state)
+		c.serverSessionUpdated(ctx, state)
 	}
 }
 
@@ -684,7 +684,7 @@ func (r *frameLimitReader) beginFrame(offset int64) { r.start = offset }
 
 func (c *ioConn) SessionID() string { return "" }
 
-func (c *ioConn) serverSessionUpdated(state ServerSessionState) {
+func (c *ioConn) serverSessionUpdated(_ context.Context, state ServerSessionState) {
 	protocolVersion := state.NegotiatedProtocolVersion
 	if protocolVersion == "" {
 		// 2025-03-26 is used, because it's the last spec version
