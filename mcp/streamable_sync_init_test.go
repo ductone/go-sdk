@@ -36,7 +36,7 @@ func TestStreamableServerConn_InitializeStateChangeIsSynchronous(t *testing.T) {
 				return nil
 			},
 		}
-		conn.sessionUpdated(context.Background(), ServerSessionState{
+		conn.serverSessionUpdated(context.Background(), ServerSessionState{
 			InitializeParams: &InitializeParams{},
 		})
 		// If the callback ran inline, it has already completed by the time
@@ -61,7 +61,7 @@ func TestStreamableServerConn_InitializeStateChangeIsSynchronous(t *testing.T) {
 		}
 		// InitializedParams != nil marks a post-initialize state change (e.g. the
 		// initialized notification or a log-level update).
-		conn.sessionUpdated(context.Background(), ServerSessionState{
+		conn.serverSessionUpdated(context.Background(), ServerSessionState{
 			InitializeParams:  &InitializeParams{},
 			InitializedParams: &InitializedParams{},
 		})

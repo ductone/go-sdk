@@ -1795,7 +1795,7 @@ func resultTypeOf(t *testing.T, server *Server, state func(*ServerSessionState),
 	t.Helper()
 	ss := &ServerSession{server: server}
 	if state != nil {
-		ss.updateState(state)
+		ss.updateState(context.Background(), state)
 	}
 	id, err := jsonrpc.MakeID("test")
 	if err != nil {
