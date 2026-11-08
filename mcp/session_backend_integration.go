@@ -243,8 +243,8 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 		State: state,
 		onClose: func() {
 			h.mu.Lock()
-			defer h.mu.Unlock()
-			if info, ok := h.sessions[sessionID]; ok {
+			info, removed := h.sessions[sessionID]
+			if removed {
 				info.stopTimer()
 				delete(h.sessions, sessionID)
 				if h.onTransportDeletion != nil {
@@ -252,6 +252,10 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 				}
 				// Note: We don't delete from backend here - the session might
 				// be accessed by another pod. Let TTL or explicit DELETE handle it.
+			}
+			h.mu.Unlock()
+			if removed && h.opts.OnSessionEvicted != nil {
+				h.opts.OnSessionEvicted(sessionID)
 			}
 		},
 	}
