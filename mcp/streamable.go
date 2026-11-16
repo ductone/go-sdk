@@ -187,12 +187,13 @@ type StreamableHTTPOptions struct {
 	// upon stream resumption.
 	EventStore EventStore
 
-	// OnSessionEvicted, if set, is called after a session that was created
-	// from backend state (a cross-pod restore) is closed and removed from this
-	// handler's local session cache — by idle timeout or an explicit DELETE.
-	// The backend record is deliberately NOT deleted on that path (another pod
-	// may still own the live session), so embedding applications that mirror
-	// sessions in per-pod state need this signal to release their mirror.
+	// OnSessionEvicted, if set, is called when a SessionBackend is configured
+	// and a session is closed and removed from this handler's local session
+	// cache, whether this pod created it or restored it from the backend.
+	// Local closes never delete the backend record, because another pod may be
+	// serving the session from it; only an explicit DELETE does. Embedding
+	// applications that mirror sessions in per-pod state use this signal to
+	// release their mirror.
 	//
 	// FORK: distributed-sessions.
 	OnSessionEvicted func(sessionID string)
@@ -733,6 +734,15 @@ func (h *StreamableHTTPHandler) serveStatefulDELETE(w http.ResponseWriter, req *
 		return
 	}
 
+	// FORK: distributed-sessions - closing the local session no longer touches
+	// the backend, so an explicit DELETE removes the record itself.
+	if h.hasSessionBackend() {
+		if err := h.deleteSessionFromBackend(req.Context(), sessionID); err != nil {
+			h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", sessionID)
+			http.Error(w, "failed to delete session", http.StatusInternalServerError)
+			return
+		}
+	}
 	sessInfo.session.Close()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -861,23 +871,21 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 	connectOpts := &ServerSessionOptions{
 		onClose: func() {
 			h.mu.Lock()
-			defer h.mu.Unlock()
-			if info, ok := h.sessions[transport.SessionID]; ok {
+			info, removed := h.sessions[transport.SessionID]
+			if removed {
 				info.stopTimer()
 				delete(h.sessions, transport.SessionID)
-				// FORK: distributed-sessions - cleanup backend
-				if h.hasSessionBackend() {
-					// Use background context since the request context may be done.
-					// Add a timeout to avoid blocking indefinitely if the backend is slow.
-					deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
-					if err := h.deleteSessionFromBackend(deleteCtx, transport.SessionID); err != nil {
-						h.opts.Logger.Error("failed to delete session from backend", "error", err, "sessionID", transport.SessionID)
-					}
-					deleteCancel()
-				}
 				if h.onTransportDeletion != nil {
 					h.onTransportDeletion(transport.SessionID)
 				}
+			}
+			h.mu.Unlock()
+			// FORK: distributed-sessions - a local close (idle timeout, failed
+			// initialization) leaves the backend record alone: other pods may
+			// be serving the session from it. Explicit DELETE removes it in
+			// serveStatefulDELETE; otherwise the backend's TTL reaps it.
+			if removed && h.hasSessionBackend() && h.opts.OnSessionEvicted != nil {
+				h.opts.OnSessionEvicted(transport.SessionID)
 			}
 		},
 	}
@@ -900,6 +908,7 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 	if h.opts.SessionTimeout > 0 {
 		sessInfo.timeout = h.opts.SessionTimeout
 		sessInfo.timer = time.AfterFunc(sessInfo.timeout, func() {
+			h.opts.Logger.Info("closing idle session", "sessionID", transport.SessionID, "timeout", sessInfo.timeout)
 			sessInfo.session.Close()
 		})
 	}
