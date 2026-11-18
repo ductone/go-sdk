@@ -405,6 +405,67 @@ func writeJSONRPCError(w http.ResponseWriter, status int, id jsonrpc.ID, jerr *j
 	}
 }
 
+// writeStatefulVersionRejection refuses a call at protocol version 2026-07-28
+// or later on a stateful server, advertising the legacy versions in advertised
+// so the client can fall back to initialize.
+func writeStatefulVersionRejection(w http.ResponseWriter, req *http.Request, logger *slog.Logger, id jsonrpc.ID, protocolVersion string, advertised []string) {
+	logger.Warn(fmt.Sprintf(
+		"rejecting request with protocol version %q: this server is stateful; set StreamableHTTPOptions.Stateless = true to accept it",
+		protocolVersion), "userAgent", req.UserAgent())
+	if plaintextstatefulrejection == "1" {
+		http.Error(w, fmt.Sprintf(
+			"Bad Request: protocol version %q is only supported on stateless HTTP servers (set StreamableHTTPOptions.Stateless = true)",
+			protocolVersion),
+			http.StatusBadRequest)
+		return
+	}
+	legacyVersions := slices.DeleteFunc(slices.Clone(advertised), func(v string) bool {
+		return v >= protocolVersion20260728
+	})
+	data, _ := json.Marshal(UnsupportedProtocolVersionData{
+		Supported: legacyVersions,
+		Requested: protocolVersion,
+	})
+	writeJSONRPCError(w, http.StatusBadRequest, id, &jsonrpc.Error{
+		Code:    CodeUnsupportedProtocolVersion,
+		Message: fmt.Sprintf("protocol version %q is not supported by this server", protocolVersion),
+		Data:    data,
+	})
+}
+
+// rejectSessionlessModernCall writes the stateful version rejection for a
+// single call whose Mcp-Protocol-Version header is 2026-07-28 or later, and
+// reports whether it did. It runs before a Server exists, so it advertises the
+// SDK's legacy versions; servePOST advertises the Server's narrowed list. Any
+// other request is left for servePOST with its body restored.
+func (h *StreamableHTTPHandler) rejectSessionlessModernCall(w http.ResponseWriter, req *http.Request) bool {
+	protocolVersion := protocolVersionFromContext(req.Context())
+	if protocolVersion < protocolVersion20260728 || len(req.Header.Values(lastEventIDHeader)) > 0 {
+		return false
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, fmt.Sprintf("request body exceeds %d bytes", mbe.Limit), http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+		}
+		return true
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	incoming, isBatch, err := readBatch(body)
+	if err != nil || isBatch || len(incoming) != 1 {
+		return false
+	}
+	jreq, ok := incoming[0].(*jsonrpc.Request)
+	if !ok || !jreq.IsCall() {
+		return false
+	}
+	writeStatefulVersionRejection(w, req, h.opts.Logger, jreq.ID, protocolVersion, supportedProtocolVersions)
+	return true
+}
+
 func (h *StreamableHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// DNS rebinding protection: auto-enabled for localhost servers.
 	// See: https://modelcontextprotocol.io/specification/2025-11-25/basic/security_best_practices#local-mcp-server-compromise
@@ -787,6 +848,11 @@ func (h *StreamableHTTPHandler) serveStatefulPOST(w http.ResponseWriter, req *ht
 	}
 
 	// No session ID: create a new session.
+	// FORK: early-version-reject - refuse a call this stateful handler cannot
+	// serve before getServer and backend session creation, which are costly.
+	if h.rejectSessionlessModernCall(w, req) {
+		return
+	}
 	server := h.getServer(req)
 	if !h.validateProtocolVersion(w, protocolVersionFromContext(req.Context()), server) {
 		return
@@ -2005,28 +2071,11 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 							http.StatusBadRequest)
 						return
 					}
-					// Advertise only the legacy versions this stateful server accepts
-					// (i.e. exclude 2026-07-28, since that's what the request asked for
-					// and what we're rejecting).
 					advertised := supportedProtocolVersions
 					if c.server != nil {
 						advertised = c.server.protocolVersions
 					}
-					legacyVersions := slices.DeleteFunc(slices.Clone(advertised), func(v string) bool {
-						return v >= protocolVersion20260728
-					})
-					data, _ := json.Marshal(UnsupportedProtocolVersionData{
-						Supported: legacyVersions,
-						Requested: protocolVersion,
-					})
-					c.logger.Warn(fmt.Sprintf(
-						"rejecting request with protocol version %q: this server is stateful; set StreamableHTTPOptions.Stateless = true to accept it",
-						protocolVersion))
-					writeJSONRPCError(w, http.StatusBadRequest, jreq.ID, &jsonrpc.Error{
-						Code:    CodeUnsupportedProtocolVersion,
-						Message: fmt.Sprintf("protocol version %q is not supported by this server", protocolVersion),
-						Data:    data,
-					})
+					writeStatefulVersionRejection(w, req, c.logger, jreq.ID, protocolVersion, advertised)
 					return
 				}
 				if headerVersion == "" {
