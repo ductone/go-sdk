@@ -275,6 +275,7 @@ func (h *StreamableHTTPHandler) createLocalSessionFromBackend(ctx context.Contex
 	if h.opts.SessionTimeout > 0 {
 		sessInfo.timeout = h.opts.SessionTimeout
 		sessInfo.timer = time.AfterFunc(sessInfo.timeout, func() {
+			h.opts.Logger.Info("closing idle session", "sessionID", sessionID, "timeout", sessInfo.timeout, "restored", true)
 			sessInfo.session.Close()
 		})
 	}
